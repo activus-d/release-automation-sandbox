@@ -1,0 +1,260 @@
+name: Release
+
+# One workflow for every channel, modeled on the public design of
+# paperclipai/paperclip's release workflow and simplified for a sandbox.
+# - The nightly runs on a schedule or by dispatch. Beta and stable run by dispatch.
+# - npm-beta and npm-stable are GitHub environments with a required reviewer.
+#   The agent that dispatches a run never approves these gates.
+# - Every npm publish is a dry run.
+
+on:
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Release channel
+        required: true
+        type: choice
+        options: [nightly, beta, stable]
+        default: nightly
+      source_version:
+        description: "beta: exact nightly version to promote. stable: exact beta version to promote."
+        required: false
+        type: string
+      stable_date:
+        description: "stable: UTC date in YYYY-MM-DD format"
+        required: false
+        type: string
+      build_optional_artifacts:
+        description: Run the optional artifact job. Leave it off to reproduce the skipped-job trap in canonicalize_stable_notes.
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  select:
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.select.outputs.channel }}
+      version: ${{ steps.select.outputs.version }}
+      sha: ${{ steps.select.outputs.sha }}
+      beta_version: ${{ steps.select.outputs.beta_version }}
+      notes_mode: ${{ steps.select.outputs.notes_mode }}
+      notes_path: ${{ steps.select.outputs.notes_path }}
+      notes_ref: ${{ steps.select.outputs.notes_ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+      - id: select
+        env:
+          CHANNEL: ${{ github.event_name == 'schedule' && 'nightly' || inputs.channel }}
+          SOURCE_VERSION: ${{ inputs.source_version }}
+          STABLE_DATE: ${{ inputs.stable_date }}
+        run: ./scripts/select.sh
+
+  verify:
+    needs: select
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.select.outputs.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm test
+
+  # Stands in for Paperclip's release_runner_binaries: a job that is skipped
+  # on most runs and sits upstream of the publish jobs.
+  optional_artifacts:
+    needs: select
+    if: ${{ inputs.build_optional_artifacts == true }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Building optional artifacts for ${{ needs.select.outputs.version }}"
+
+  publish_nightly:
+    needs: [select, verify, optional_artifacts]
+    if: ${{ !cancelled() && needs.select.outputs.channel == 'nightly' && needs.verify.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.optional_artifacts.result) }}
+    runs-on: ubuntu-latest
+    environment: npm-canary
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.select.outputs.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - env:
+          CHANNEL: nightly
+          VERSION: ${{ needs.select.outputs.version }}
+          SHA: ${{ needs.select.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/publish.sh
+
+  publish_beta:
+    needs: [select, verify, optional_artifacts]
+    if: ${{ !cancelled() && needs.select.outputs.channel == 'beta' && needs.verify.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.optional_artifacts.result) }}
+    runs-on: ubuntu-latest
+    environment: npm-beta
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.select.outputs.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - env:
+          CHANNEL: beta
+          VERSION: ${{ needs.select.outputs.version }}
+          SHA: ${{ needs.select.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/publish.sh
+
+  draft_stable_notes:
+    needs: [select, publish_beta]
+    if: ${{ !cancelled() && needs.publish_beta.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+      - name: Draft and push the notes branch
+        env:
+          BETA_VERSION: ${{ needs.select.outputs.version }}
+          SHA: ${{ needs.select.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin --tags --quiet
+          ./scripts/draft-stable-notes.sh "${BETA_VERSION}" "${SHA}"
+          branch="release-notes/v${BETA_VERSION}"
+          git checkout -B "${branch}"
+          git add "releases/beta/v${BETA_VERSION}.md"
+          git commit -m "docs(release): draft stable notes for beta ${BETA_VERSION}"
+          git push -f origin "${branch}"
+          {
+            echo "## Stable notes draft pushed"
+            echo ""
+            echo "- Branch: \`${branch}\`"
+            echo "- Open the PR (a person opens it so CI runs):"
+            echo "  https://github.com/${GITHUB_REPOSITORY}/compare/master...${branch}?expand=1"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  smoke:
+    needs: [select, publish_nightly, publish_beta, publish_stable]
+    if: ${{ !cancelled() && (needs.publish_nightly.result == 'success' || needs.publish_beta.result == 'success' || needs.publish_stable.result == 'success') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.select.outputs.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check the tag and the packed package
+        env:
+          CHANNEL: ${{ needs.select.outputs.channel }}
+          VERSION: ${{ needs.select.outputs.version }}
+        run: |
+          set -euo pipefail
+          case "${CHANNEL}" in
+            nightly) tag="nightly/v${VERSION}" ;;
+            beta) tag="beta/v${VERSION}" ;;
+            stable) tag="v${VERSION}" ;;
+          esac
+          git fetch origin --tags --force --quiet
+          git rev-parse -q --verify "refs/tags/${tag}" >/dev/null
+          npm pack --silent
+          mkdir smoke && tar -xzf release-automation-sandbox-*.tgz -C smoke
+          node -e "const { greet } = require('./smoke/package'); if (greet('x') !== 'Hello, x!') process.exit(1)"
+          echo "- Smoke passed for \`${tag}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  publish_stable:
+    needs: [select, verify, optional_artifacts]
+    if: ${{ !cancelled() && needs.select.outputs.channel == 'stable' && needs.verify.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.optional_artifacts.result) }}
+    runs-on: ubuntu-latest
+    environment: npm-stable
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.select.outputs.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Read the notes at the pinned revision
+        env:
+          NOTES_REF: ${{ needs.select.outputs.notes_ref }}
+          NOTES_PATH: ${{ needs.select.outputs.notes_path }}
+        run: |
+          git fetch origin master --quiet
+          git show "${NOTES_REF}:${NOTES_PATH}" > "$RUNNER_TEMP/stable-notes.md"
+      - env:
+          CHANNEL: stable
+          VERSION: ${{ needs.select.outputs.version }}
+          SHA: ${{ needs.select.outputs.sha }}
+          NOTES_FILE: ${{ runner.temp }}/stable-notes.md
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/publish.sh
+
+  # Deliberately copies the condition that skipped Paperclip's job on
+  # v2026.1023.0. With no status function, GitHub adds an implicit success()
+  # that checks every upstream job. optional_artifacts sits upstream of
+  # publish_stable and is usually skipped, so this job is skipped too.
+  canonicalize_stable_notes:
+    needs: [select, publish_stable]
+    if: ${{ needs.select.outputs.notes_mode == 'master_beta' && needs.publish_stable.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+      - name: Push the canonicalization branch
+        env:
+          VERSION: ${{ needs.select.outputs.version }}
+          NOTES_REF: ${{ needs.select.outputs.notes_ref }}
+          NOTES_PATH: ${{ needs.select.outputs.notes_path }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          branch="release-notes/v${VERSION}-canonicalize"
+          git checkout -B "${branch}"
+          git show "${NOTES_REF}:${NOTES_PATH}" > "releases/v${VERSION}.md"
+          git add "releases/v${VERSION}.md"
+          git rm -q "${NOTES_PATH}"
+          git commit -m "docs(release): canonicalize stable notes for v${VERSION}"
+          git push -f origin "${branch}"
+          {
+            echo "## Stable notes canonicalization pushed"
+            echo ""
+            echo "- Open and merge the PR (a person opens it so CI runs):"
+            echo "  https://github.com/${GITHUB_REPOSITORY}/compare/master...${branch}?expand=1"
+          } >> "$GITHUB_STEP_SUMMARY"

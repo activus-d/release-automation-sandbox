@@ -1,0 +1,11 @@
+{
+  "name": "release-automation-sandbox",
+  "version": "0.0.0",
+  "description": "Sandbox package for testing a gated nightly, beta, and stable release workflow. Publishes run as npm dry runs.",
+  "main": "index.js",
+  "files": ["index.js"],
+  "scripts": {
+    "test": "node --test"
+  },
+  "license": "MIT"
+}
