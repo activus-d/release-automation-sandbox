@@ -221,13 +221,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: ./scripts/publish.sh
 
-  # Deliberately copies the condition that skipped Paperclip's job on
-  # v2026.1023.0. With no status function, GitHub adds an implicit success()
-  # that checks every upstream job. optional_artifacts sits upstream of
-  # publish_stable and is usually skipped, so this job is skipped too.
+  # The condition carries an explicit status function. Without one, GitHub
+  # adds an implicit success() that checks every upstream job, and a skipped
+  # optional_artifacts upstream of publish_stable skipped this job even when
+  # the publish succeeded (run 45860757794, the same failure as Paperclip's
+  # v2026.1023.0).
   canonicalize_stable_notes:
     needs: [select, publish_stable]
-    if: ${{ needs.select.outputs.notes_mode == 'master_beta' && needs.publish_stable.result == 'success' }}
+    if: ${{ !cancelled() && needs.select.outputs.notes_mode == 'master_beta' && needs.publish_stable.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
